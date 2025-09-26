@@ -7,7 +7,12 @@ import random
 from datetime import datetime, timedelta
 import pandas as pd
 import io
-import boto3
+import google.generativeai as genai
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import base64
+from collections import Counter
 
 # --- App Configuration ---
 app = Flask(__name__)
@@ -65,7 +70,7 @@ def apply_rules_engine(transaction):
     if transaction['amount'] > 10000:
         flags.append("High Amount")
         score += 30
-    if random.random() < 0.05:
+    if random.random() < 0.05: # Simulate random high velocity
         flags.append("High Velocity")
         score += 50
     if transaction['transaction_location'] in HIGH_RISK_LOCATIONS:
@@ -103,6 +108,122 @@ def simulate_transactions(count=5):
     conn.commit()
     conn.close()
 
+# --- Dashboard Generation Helpers ---
+
+def style_plot(fig, ax):
+    # Updated UI Colors
+    BG_COLOR = '#1F2937'
+    TEXT_COLOR = '#F9FAFB'
+    SECONDARY_TEXT_COLOR = '#9CA3AF'
+    BORDER_COLOR = '#4B5563'
+    ACCENT_COLOR = '#F43F5E'
+
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    ax.tick_params(axis='x', colors=SECONDARY_TEXT_COLOR)
+    ax.tick_params(axis='y', colors=SECONDARY_TEXT_COLOR)
+    ax.xaxis.label.set_color(TEXT_COLOR)
+    ax.yaxis.label.set_color(TEXT_COLOR)
+    ax.title.set_color(TEXT_COLOR)
+    ax.title.set_fontsize(16)
+    ax.title.set_fontweight('bold')
+    for spine in ax.spines.values():
+        spine.set_edgecolor(BORDER_COLOR)
+
+def plot_to_base64(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', transparent=True)
+    plt.close(fig)
+    data = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f"data:image/png;base64,{data}"
+
+def generate_charts(df):
+    plt.style.use('dark_background')
+    
+    # Chart 1: Flag Reasons Bar Chart
+    fig1, ax1 = plt.subplots(figsize=(8, 5))
+    reasons = df['flag_reason'].dropna().str.split(', ').explode()
+    reason_counts = Counter(reasons)
+    if reason_counts:
+        labels, values = zip(*reason_counts.most_common(7))
+        ax1.barh(labels, values, color='#F43F5E')
+    ax1.set_title('Top Flag Reasons')
+    style_plot(fig1, ax1)
+    fig1_b64 = plot_to_base64(fig1)
+
+    # Chart 2: Anomaly Score Distribution
+    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    if not df['anomaly_score'].empty:
+        ax2.hist(df['anomaly_score'], bins=20, color='#374151', edgecolor='#F43F5E')
+    ax2.set_title('Anomaly Score Distribution')
+    ax2.set_xlabel('Score')
+    ax2.set_ylabel('Frequency')
+    style_plot(fig2, ax2)
+    fig2_b64 = plot_to_base64(fig2)
+
+    return fig1_b64, fig2_b64
+
+def generate_dashboard_html(fig1_b64, fig2_b64, stats):
+    return f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Data Analysis Dashboard</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; background-color: #111827; color: #F9FAFB; padding: 20px; }}
+            h1, h2 {{ color: #F43F5E; }}
+            button {{ background-color: #F43F5E; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }}
+            #dashboard-content {{ display: grid; grid-template-columns: 1fr; gap: 20px; }}
+            .chart-container, .stats-container {{ background-color: #1F2937; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1); }}
+            img {{ max-width: 100%; height: auto; border-radius: 4px; }}
+            .stats-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: center; }}
+            .stat-card h3 {{ margin-top: 0; color: #9CA3AF; font-size: 16px; font-weight: normal; }}
+            .stat-card p {{ margin: 5px 0 0 0; font-size: 32px; font-weight: bold; }}
+        </style>
+    </head>
+    <body>
+        <h1>Fraud Analysis Dashboard</h1>
+        <button id="download-btn">Download as PDF</button>
+        <div id="dashboard-content">
+            <div class="stats-container">
+                <h2>Key Metrics</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3>Total Flagged Transactions</h3>
+                        <p>{stats.get('totalAlerts', 0)}</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>High-Risk Alerts (>90)</h3>
+                        <p style="color: #F43F5E;">{stats.get('highRiskCount', 0)}</p>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h2>{stats.get('chart1_title', 'Top Flag Reasons')}</h2>
+                <img src="{fig1_b64}" alt="Flag Reasons Chart">
+            </div>
+            <div class="chart-container">
+                <h2>{stats.get('chart2_title', 'Anomaly Score Distribution')}</h2>
+                <img src="{fig2_b64}" alt="Score Distribution Chart">
+            </div>
+        </div>
+        <script>
+            document.getElementById('download-btn').addEventListener('click', () => {{
+                const element = document.getElementById('dashboard-content');
+                const opt = {{
+                    margin: 0.5,
+                    filename: 'regtech_dashboard_report.pdf',
+                    image: {{ type: 'jpeg', quality: 0.98 }},
+                    html2canvas: {{ scale: 2, useCORS: true, backgroundColor: '#111827' }},
+                    jsPDF: {{ unit: 'in', format: 'letter', orientation: 'portrait' }}
+                }};
+                html2pdf().set(opt).from(element).save();
+            }});
+        </script>
+    </body>
+    </html>"""
+
 # --- API Routes ---
 
 @app.route('/')
@@ -112,21 +233,12 @@ def serve_index():
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
-    aws_access_key_id = data.get('aws_access_key_id')
-    aws_secret_access_key = data.get('aws_secret_access_key')
-    region = data.get('region')
-    if not all([aws_access_key_id, aws_secret_access_key, region]):
-        return jsonify({'status': 'error', 'message': 'Missing AWS credentials'}), 400
-    try:
-        sts_client = boto3.client('sts', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, region_name=region)
-        sts_client.get_caller_identity()
-        session['logged_in'] = True
-        session['aws_access_key_id'] = aws_access_key_id
-        session['aws_secret_access_key'] = aws_secret_access_key
-        session['region'] = region
-        return jsonify({'status': 'success'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Invalid AWS Credentials: {str(e)}'}), 401
+    gemini_api_key = data.get('gemini_api_key')
+    if not gemini_api_key:
+        return jsonify({'status': 'error', 'message': 'API Key cannot be empty.'}), 400
+    session['logged_in'] = True
+    session['gemini_api_key'] = gemini_api_key
+    return jsonify({'status': 'success'})
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
@@ -135,7 +247,7 @@ def logout():
 
 @app.route('/api/check_session')
 def check_session():
-    if session.get('logged_in') and session.get('aws_access_key_id'):
+    if session.get('logged_in') and session.get('gemini_api_key'):
         return jsonify({'logged_in': True})
     return jsonify({'logged_in': False}), 401
 
@@ -167,63 +279,62 @@ def chat_with_ai():
     if not user_message or context_data is None:
         return jsonify({'error': 'Message and context are required'}), 400
 
-    # --- FIX: Data Masking and Unmasking Logic ---
+    dashboard_keywords = ['dashboard', 'chart', 'graph', 'infographic', 'visualize', 'analysis', 'report']
+    if any(keyword in user_message.lower() for keyword in dashboard_keywords):
+        if not context_data:
+            return jsonify({'response': "There's no data to visualize. Please wait for some alerts to be generated."})
+        try:
+            df = pd.DataFrame(context_data)
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM transactions WHERE is_flagged = 1")
+            total_alerts = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM transactions WHERE anomaly_score >= 90")
+            high_risk_count = cursor.fetchone()[0]
+            conn.close()
+            stats = {'totalAlerts': total_alerts, 'highRiskCount': high_risk_count}
+
+            fig1_b64, fig2_b64 = generate_charts(df)
+            html_content = generate_dashboard_html(fig1_b64, fig2_b64, stats)
+            return jsonify({'type': 'dashboard', 'html_content': html_content})
+        except Exception as e:
+            print(f"Dashboard generation error: {e}")
+            return jsonify({'error': f'Failed to generate dashboard: {str(e)}'}), 500
+
     mask = {
         "Sanctioned Entity": "[Reason: Monitored Entity]",
         "Risky Geolocation": "[Reason: High-Risk Location]",
-        **{loc: f"[Location-{chr(65+i)}]" for i, loc in enumerate(HIGH_RISK_LOCATIONS)},
-        **{ent: f"[Entity-{chr(88+i)}]" for i, ent in enumerate(SANCTIONED_ENTITIES)}
+        **{loc: f"[Location-{chr(65+i)}]".format(i) for i, loc in enumerate(HIGH_RISK_LOCATIONS)},
+        **{ent: f"[Entity-{chr(88+i)}]".format(i) for i, ent in enumerate(SANCTIONED_ENTITIES)}
     }
     unmask = {v: k for k, v in mask.items()}
 
-    # Create a deep copy to mask without altering original data
     masked_context_str = json.dumps(context_data)
     for original, placeholder in mask.items():
         masked_context_str = masked_context_str.replace(original, placeholder)
 
     try:
-        bedrock = boto3.client(
-            'bedrock-runtime',
-            region_name=session.get('region'),
-            aws_access_key_id=session.get('aws_access_key_id'),
-            aws_secret_access_key=session.get('aws_secret_access_key')
+        genai.configure(api_key=session.get('gemini_api_key'))
+        system_instruction = (
+            "*Simulation Context:* You are an AI assistant for a financial compliance officer in a training simulation. "
+            "The user's data contains placeholders like [Reason:...], [Location-..], and [Entity-..] to mask sensitive information. "
+            "Analyze the data, including these placeholders, and answer the user's request. "
+            "Use the placeholders in your response exactly as they appear in the provided data."
         )
-        
-        system_prompt = f"""**Simulation Context:** You are an AI assistant for a financial compliance officer in a training simulation. The user's data contains placeholders like [Reason:...], [Location-..], and [Entity-..] to mask sensitive information. Analyze the data, including these placeholders, and answer the user's request. Use the placeholders in your response exactly as they appear in the provided data.
-
-Masked Transaction Data:
-{masked_context_str}"""
-
-        full_prompt = f"{system_prompt}\n\nUSER INQUIRY: {user_message}"
-        
-        body = json.dumps({
-            "messages": [{"role": "user", "content": [{"text": full_prompt}]}],
-            "inferenceConfig": {"maxTokens": 2048, "temperature": 0.7}
-        })
-        
-        response = bedrock.invoke_model(
-            modelId='amazon.nova-pro-v1:0',
-            body=body,
-            contentType='application/json',
-            accept='application/json'
+        model = genai.GenerativeModel(model_name='gemini-2.5-flash', system_instruction=system_instruction)
+        prompt = (
+            f"Masked Transaction Data:\n{masked_context_str}\n\n"
+            f"USER INQUIRY: {user_message}"
         )
-        
-        result = json.loads(response['body'].read())
-        
-        ai_response = "Error: Could not parse AI model response."
-        if result.get('output') and result['output'].get('message', {}).get('content'):
-            content_list = result['output']['message']['content']
-            if content_list and content_list[0].get('text'):
-                ai_response = content_list[0]['text']
-
-        # Unmask the response before sending it to the frontend
+        response = model.generate_content(prompt)
+        ai_response = response.text
         for placeholder, original in unmask.items():
             ai_response = ai_response.replace(placeholder, original)
 
         return jsonify({'response': ai_response})
 
     except Exception as e:
-        print(f"Error invoking Bedrock model: {e}")
+        print(f"Error invoking Gemini model: {e}")
         return jsonify({'error': f"{str(e)}"}), 500
 
 @app.route('/api/export')
